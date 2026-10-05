@@ -1,5 +1,9 @@
 package com.andrei.pokerface;
 
+/* Helper functions for manipulations with deck cards.
+ * Contains helpers to compute card ranks & suits, and to display cards
+ * as human-readable strings.
+ */
 public final class CardUtils {
     private CardUtils() {}
 
@@ -35,7 +39,7 @@ public final class CardUtils {
      * Converts a card ID (0-51) to a string like "Ac", "Kh", "2d", etc.
      */
     public static String cardToString(int card) {
-        if (card < 0 || card > 52) {
+        if (card < 0 || card > 51) {
             throw new IllegalArgumentException("Card does not exist.");
         }
         int rank = getRank(card), suit = getSuit(card);

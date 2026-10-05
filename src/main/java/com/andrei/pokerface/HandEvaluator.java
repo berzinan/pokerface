@@ -1,355 +1,390 @@
 package com.andrei.pokerface;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.List;
-import java.util.Collections;
-import java.util.Set;
-import java.util.HashSet;
 
-
+/**
+ * Scores a poker hand of 5 or more cards (7 in normal play: 2 hole + 5 board).
+ *
+ * Everything derives from a single pass over the cards, captured in Counts:
+ * how many cards of each rank, which ranks are present as a bitmask, and the
+ * same mask per suit. Straight detection is then a shift-and-compare over the
+ * mask rather than a search, flushes are a popcount, and every made-hand check
+ * is a descending scan of a 15-element array.
+ *
+ * The previous implementation rebuilt a HashMap<Integer,Integer> of rank
+ * counts inside each of the nine evaluateX methods, and evaluateBestHand calls
+ * up to all nine -- so one scored hand built as many as seven rank maps and
+ * two suit maps, each boxing every key and value, all computing exactly the
+ * same thing from exactly the same input. Measured at roughly 1.1-5 us per
+ * evaluation, which made it the dominant cost of a MonteCarlo rollout and
+ * therefore of the whole benchmark pipeline.
+ *
+ * The nine public evaluateX(int[]) methods are kept with unchanged signatures
+ * and unchanged return formats. They are now thin wrappers that count once and
+ * delegate; evaluateBestHand and describeBestHand count once for the whole
+ * dispatch chain instead of once per step.
+ *
+ * Returned rank arrays are ordered most-significant first, ready for
+ * encodeScore, and an empty array is the "this hand type is not present"
+ * sentinel. Fewer than five cards is handled by returning a shorter array
+ * rather than throwing: encodeScore pads with zeros, which scores identically
+ * to the old zero-padded behaviour.
+ */
 public class HandEvaluator {
 
+    /* -------------------------------------------------------------- */
+    /* Single-pass derivation                                          */
+    /* -------------------------------------------------------------- */
 
-   private static Map<Integer, Integer> countRanks(int[] cards) {
-        // Return mapping of card poker value -> appearance count in cards
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (int i: cards) {
-            counts.put(CardUtils.pokerValue(i), counts.getOrDefault(CardUtils.pokerValue(i), 0) + 1);
-        }
-        return counts;
-   }
-   
-   private static Map<Integer, Integer> countSuits(int[] cards) {
-        // Return mapping of card suit -> appearance count in cards
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (int c : cards) {
-            counts.put(CardUtils.getSuit(c), counts.getOrDefault(CardUtils.getSuit(c), 0) + 1);
-        }
-        return counts;
-   }
+    /**
+     * Everything the evaluators need, computed once.
+     *
+     * rankCounts is indexed by poker value (2..14), so index 0, 1 and any
+     * unused slot stay zero. suitRankMask is indexed by suit (1..4); a suit
+     * cannot hold two cards of the same rank, so the bit count of its mask is
+     * also its card count.
+     */
+    private static final class Counts {
+        final int[] rankCounts = new int[15];
+        final int[] suitRankMask = new int[5];
+        int rankMask;    // bit r set when poker value r is present in any suit
+        int flushSuit;   // 1..4, or 0 when no suit has five or more cards
 
-   public static int[] evaluateHighCard(int[] cards) {
-        int[] ranks = new int[7];
-        int idx = 0;
-        for (int c: cards) { 
-            ranks[idx] = CardUtils.pokerValue(c);
-            idx++;
+        Counts(int[] cards) {
+            for (int card : cards) {
+                int value = CardUtils.pokerValue(card);
+                int suit = CardUtils.getSuit(card);
+                rankCounts[value]++;
+                rankMask |= 1 << value;
+                suitRankMask[suit] |= 1 << value;
+            }
+            for (int suit = 1; suit <= 4; suit++) {
+                if (Integer.bitCount(suitRankMask[suit]) >= 5) {
+                    flushSuit = suit;
+                    break; // seven cards cannot produce two five-card suits
+                }
+            }
         }
-        // Sort (ascending order)
-        Arrays.sort(ranks);
+    }
 
-        // Return 5 highest ranks (5 last elements)
-        int[] result =  Arrays.copyOfRange(ranks, ranks.length - 5, ranks.length);
-
-        // reverse to get descending order
-        for (int i = 0; i < result.length / 2; i ++) {
-            int temp = result[i];
-            result[i] = result[result.length - 1 - i];
-            result[result.length - 1 - i] = temp;
+    /** Highest poker value appearing at least minCount times, or 0 if none does. */
+    private static int highestWithCount(int[] rankCounts, int minCount) {
+        for (int rank = 14; rank >= 2; rank--) {
+            if (rankCounts[rank] >= minCount) {
+                return rank;
+            }
         }
+        return 0;
+    }
+
+    /**
+     * The n highest card values, descending, counting duplicates, skipping the
+     * two excluded ranks. Pass -1 to exclude nothing. Returns a shorter array
+     * when fewer than n cards qualify.
+     *
+     * Duplicates count because that is what the hand rules require: the
+     * kickers beside a pair in AAKKQ are K, K, Q, not K, Q and then a third
+     * distinct rank.
+     */
+    private static int[] topValues(int[] rankCounts, int n, int exclude1, int exclude2) {
+        int[] out = new int[n];
+        int found = 0;
+        for (int rank = 14; rank >= 2 && found < n; rank--) {
+            if (rank == exclude1 || rank == exclude2) {
+                continue;
+            }
+            for (int i = 0; i < rankCounts[rank] && found < n; i++) {
+                out[found++] = rank;
+            }
+        }
+        return found == n ? out : Arrays.copyOf(out, found);
+    }
+
+    /** The n highest ranks present in a rank bitmask, descending. No duplicates possible. */
+    private static int[] topFromMask(int mask, int n) {
+        int[] out = new int[n];
+        int found = 0;
+        for (int rank = 14; rank >= 2 && found < n; rank--) {
+            if ((mask & (1 << rank)) != 0) {
+                out[found++] = rank;
+            }
+        }
+        return found == n ? out : Arrays.copyOf(out, found);
+    }
+
+    /**
+     * Highest card of the best straight in a rank bitmask, or 0 if there is
+     * none.
+     *
+     * The ace-low wheel is handled by mirroring the ace into a virtual bit at
+     * position 1, so A-2-3-4-5 becomes the ordinary window 1..5 and needs no
+     * special case. Scanning from 14 downwards returns the best straight
+     * first, which also means a 6-high straight is found before the wheel it
+     * contains.
+     */
+    private static int straightHigh(int rankMask) {
+        int mask = rankMask;
+        if ((mask & (1 << 14)) != 0) {
+            mask |= 1 << 1; // ace plays low
+        }
+        for (int high = 14; high >= 5; high--) {
+            int window = 0b11111 << (high - 4);
+            if ((mask & window) == window) {
+                return high;
+            }
+        }
+        return 0;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Hand-type checks (operate on precomputed Counts)                */
+    /* -------------------------------------------------------------- */
+
+    private static int[] highCardOf(Counts c) {
+        return topValues(c.rankCounts, 5, -1, -1);
+    }
+
+    private static int[] pairOf(Counts c) {
+        int pair = highestWithCount(c.rankCounts, 2);
+        if (pair == 0) {
+            return new int[0];
+        }
+        int[] kickers = topValues(c.rankCounts, 3, pair, -1);
+        int[] result = new int[1 + kickers.length];
+        result[0] = pair;
+        System.arraycopy(kickers, 0, result, 1, kickers.length);
         return result;
-   }
+    }
 
-   public static int[] evaluatePair(int[] cards) {
-        // compute rank of highest pair
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        int highestPairRank = 0;
-        for (int k: rankCounts.keySet()) {
-            if (rankCounts.get(k) >= 2 && k > highestPairRank) {
-                highestPairRank = k;
-            }
-        }
-        // No pair found: return empty array as sentinel.
-        if (highestPairRank == 0) {
+    private static int[] twoPairOf(Counts c) {
+        int highPair = highestWithCount(c.rankCounts, 2);
+        if (highPair == 0) {
             return new int[0];
         }
-        else {
-            // compile kicker candidates
-            List<Integer> candidateKickers = new ArrayList<>();
-            for (int c : cards) {
-                if (CardUtils.pokerValue(c) != highestPairRank) {
-                    candidateKickers.add(CardUtils.pokerValue(c));
-                }
-            }
-            Collections.sort(candidateKickers);
-            int[] allKickers = candidateKickers.stream().mapToInt(Integer::intValue).toArray();
-            // choose 3 highest kickers
-            int[] kickers = Arrays.copyOfRange(allKickers, allKickers.length - 3, allKickers.length);
-            int[] merged =  {highestPairRank, kickers[2], kickers[1], kickers[0]};
-            return merged;
-        }
-   }
-
-   public static int[] evaluateTwoPair(int [] cards) {
-        // Compute list of all card ranks with at least 2 repeats
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        List<Integer> pairRanks = new ArrayList<>();
-        for (int k: rankCounts.keySet()) {
-            if (rankCounts.get(k) >= 2) {
-                pairRanks.add(k);
+        int lowPair = 0;
+        for (int rank = highPair - 1; rank >= 2; rank--) {
+            if (c.rankCounts[rank] >= 2) {
+                lowPair = rank;
+                break;
             }
         }
-        // Less than 2 distinct pairs: return empty array as sentinel
-        if (pairRanks.size() < 2) {
+        if (lowPair == 0) {
             return new int[0];
         }
-        else {
-            Collections.sort(pairRanks);
-            // find higher and lower pair
-            int highPair = pairRanks.removeLast();
-            int lowPair = pairRanks.removeLast();
-            // compute candidate kickers
-            List<Integer> candidateKickers = new ArrayList<>();
-            for (int c : cards) {
-                if (CardUtils.pokerValue(c) != highPair && CardUtils.pokerValue(c) != lowPair) {
-                    candidateKickers.add(CardUtils.pokerValue(c));
-                }
+        // Highest card outside both pairs. Zero when none exists (quads plus
+        // trips, say) -- the old code threw NoSuchElementException there.
+        int kicker = 0;
+        for (int rank = 14; rank >= 2; rank--) {
+            if (rank != highPair && rank != lowPair && c.rankCounts[rank] > 0) {
+                kicker = rank;
+                break;
             }
-            // take highest kicker
-            int kicker = Collections.max(candidateKickers);
-            int[] merged = {highPair, lowPair, kicker};
-            return merged;
         }
-   }
+        return new int[]{highPair, lowPair, kicker};
+    }
 
-   public static int[] evaluateTriple(int[] cards) {
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        int highestTripRank = 0;
-        for (int k: rankCounts.keySet()) {
-            if (rankCounts.get(k) >= 3 && k > highestTripRank) {
-                highestTripRank = k;
-            }
-        }
-        if (highestTripRank == 0) {
+    private static int[] tripleOf(Counts c) {
+        int trip = highestWithCount(c.rankCounts, 3);
+        if (trip == 0) {
             return new int[0];
         }
-        else {
-            List<Integer> candidateKickers = new ArrayList<>();
-            for (int c : cards) {
-                if (CardUtils.pokerValue(c) != highestTripRank) {
-                    candidateKickers.add(CardUtils.pokerValue(c));
-                }
-            }
-            Collections.sort(candidateKickers);
-            int[] allKickers = candidateKickers.stream().mapToInt(Integer::intValue).toArray();
-            // choose 2 highest kickers
-            int[] kickers = {allKickers[allKickers.length - 1], allKickers[allKickers.length - 2]};
-            int[] merged = {highestTripRank, kickers[0], kickers[1]};
-            return merged;
-        }
-   }
+        int[] kickers = topValues(c.rankCounts, 2, trip, -1);
+        int[] result = new int[1 + kickers.length];
+        result[0] = trip;
+        System.arraycopy(kickers, 0, result, 1, kickers.length);
+        return result;
+    }
 
-   public static int[] evaluateStraight(int [] cards) {
-        // find all unique cards by pokerValue
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        Set<Integer> uniqueValues = rankCounts.keySet();
-        // Iterate through highest card candidates
-        for (int i = 14; i > 5; i--) {
-            boolean candidatePresent = uniqueValues.contains(i) && uniqueValues.contains(i-1) && 
-    uniqueValues.contains(i-2) && uniqueValues.contains(i-3) && 
-    uniqueValues.contains(i-4);
-            if (candidatePresent) {
-                int[] result = {i};
-                return result;
-            }
-        }
-        // Ace-Low edgecase
-        Set<Integer> aceLowCandidate = new HashSet<>(Arrays.asList(14, 2, 3, 4, 5));
-        if (uniqueValues.containsAll(aceLowCandidate)) {
-            int[] result = {5};
-            return result;
-        }
-        // No straight -> return sentinel
-        else {
+    private static int[] straightOf(Counts c) {
+        int high = straightHigh(c.rankMask);
+        return high == 0 ? new int[0] : new int[]{high};
+    }
+
+    private static int[] flushOf(Counts c) {
+        if (c.flushSuit == 0) {
             return new int[0];
         }
-   }
+        return topFromMask(c.suitRankMask[c.flushSuit], 5);
+    }
 
-   public static int[] evaluateFlush(int[] cards) {
-        // find flush suit
-        Map<Integer, Integer> suitCounts = countSuits(cards);
-        int flushSuit = 0;
-        for (int k: suitCounts.keySet()) {
-            if (suitCounts.get(k) >= 5) {
-                flushSuit = k;
-            }
-        }
-        // no suit has flush -> return sentinel
-        if (flushSuit == 0) {
+    private static int[] fullHouseOf(Counts c) {
+        int trip = highestWithCount(c.rankCounts, 3);
+        if (trip == 0) {
             return new int[0];
         }
-        else {
-            // Collect list of all cards with that suit
-            List<Integer> flushValues = new ArrayList<>();
-            for (int c: cards) {
-                if (CardUtils.getSuit(c) == flushSuit) {
-                    flushValues.add(CardUtils.pokerValue(c));
-                }
+        int pair = 0;
+        for (int rank = 14; rank >= 2; rank--) {
+            if (rank != trip && c.rankCounts[rank] >= 2) {
+                pair = rank;
+                break;
             }
-            Collections.sort(flushValues, Collections.reverseOrder());
-            int[] result = new int[5];
-            for (int i = 0; i < 5; i++) {
-                result[i] = flushValues.get(i);
-            }
-            return result;
         }
-   }
+        return pair == 0 ? new int[0] : new int[]{trip, pair};
+    }
 
-   public static int[] evaluateFullHouse(int[] cards) {
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        List<Integer> tripRanks = new ArrayList<>(), pairRanks = new ArrayList<>();
-        for (int k: rankCounts.keySet()) {
-            if (rankCounts.get(k) >= 2) {
-                pairRanks.add(k);
-            }
-            if (rankCounts.get(k) >= 3) {
-                tripRanks.add(k);
-            }
-        }
-        int highestTripRank = tripRanks.size() > 0 ? Collections.max(tripRanks) : 0;
-        int highestPairRank = 0;
-        for (int p: pairRanks) {
-            if (p > highestPairRank && p != highestTripRank) {
-                highestPairRank = p;
-            }
-        }
-        if (highestTripRank == 0 || highestPairRank == 0) {
+    private static int[] quadOf(Counts c) {
+        int quad = highestWithCount(c.rankCounts, 4);
+        if (quad == 0) {
             return new int[0];
         }
-        else {
-            int[] result = {highestTripRank, highestPairRank};
-            return result;
-        }
-   }
-
-   public static int[] evaluateQuad(int[] cards) {
-        Map<Integer, Integer> rankCounts = countRanks(cards);
-        int highestQuadRank = 0;
-        for (int k: rankCounts.keySet()) {
-            if (rankCounts.get(k) >= 4 && k > highestQuadRank) {
-                highestQuadRank = k;
+        int kicker = 0;
+        for (int rank = 14; rank >= 2; rank--) {
+            if (rank != quad && c.rankCounts[rank] > 0) {
+                kicker = rank;
+                break;
             }
         }
-        if (highestQuadRank == 0) {
+        return new int[]{quad, kicker};
+    }
+
+    private static int[] straightFlushOf(Counts c) {
+        if (c.flushSuit == 0) {
             return new int[0];
         }
-        else {
-            List<Integer> candidateKickers = new ArrayList<>();
-            for (int c : cards) {
-                if (CardUtils.pokerValue(c) != highestQuadRank) {
-                    candidateKickers.add(CardUtils.pokerValue(c));
-                }
-            }
-            Collections.sort(candidateKickers);
-            int kicker = candidateKickers.removeLast();
-            int[] result = {highestQuadRank, kicker};
-            return result;
-        }
-   }
+        int high = straightHigh(c.suitRankMask[c.flushSuit]);
+        return high == 0 ? new int[0] : new int[]{high};
+    }
 
-   public static int[] evaluateStraightFlush(int[] cards) {
-        // find flush suit from cards
-        Map<Integer, Integer> suitCounts = countSuits(cards);
-        int flushSuit = 0;
-        for (int k: suitCounts.keySet()) {
-            if (suitCounts.get(k) >= 5) {
-                flushSuit = k;
-            }
-        }
-        // no flush present
-        if (flushSuit == 0) return new int[0];
+    /* -------------------------------------------------------------- */
+    /* Public per-hand-type API (unchanged signatures and formats)     */
+    /* -------------------------------------------------------------- */
 
-        // filter to only cards of flush suit
-        List<Integer> suitedCards = new ArrayList<>();
-        for (int c : cards) {
-            if (CardUtils.getSuit(c) == flushSuit) {
-                suitedCards.add(c);
-            }
-        }
-        int[] suitedArray = suitedCards.stream().mapToInt(Integer::intValue).toArray();
-        // check if suited cards form a straight.
-        return evaluateStraight(suitedArray);
-   }
+    /** The five highest card values, descending. */
+    public static int[] evaluateHighCard(int[] cards) {
+        return highCardOf(new Counts(cards));
+    }
 
-   static int encodeScore(int handType, int[] ranks) {
+    /** {pairRank, k1, k2, k3} descending, or empty if no pair. */
+    public static int[] evaluatePair(int[] cards) {
+        return pairOf(new Counts(cards));
+    }
+
+    /** {highPair, lowPair, kicker}, or empty if fewer than two pairs. */
+    public static int[] evaluateTwoPair(int[] cards) {
+        return twoPairOf(new Counts(cards));
+    }
+
+    /** {tripRank, k1, k2} descending, or empty if no three of a kind. */
+    public static int[] evaluateTriple(int[] cards) {
+        return tripleOf(new Counts(cards));
+    }
+
+    /** {highCard}, 5 for the ace-low wheel, or empty if no straight. */
+    public static int[] evaluateStraight(int[] cards) {
+        return straightOf(new Counts(cards));
+    }
+
+    /** The five highest values of the flush suit, descending, or empty if no flush. */
+    public static int[] evaluateFlush(int[] cards) {
+        return flushOf(new Counts(cards));
+    }
+
+    /** {tripRank, pairRank}, or empty if no full house. */
+    public static int[] evaluateFullHouse(int[] cards) {
+        return fullHouseOf(new Counts(cards));
+    }
+
+    /** {quadRank, kicker}, or empty if no four of a kind. */
+    public static int[] evaluateQuad(int[] cards) {
+        return quadOf(new Counts(cards));
+    }
+
+    /** {highCard} of the best straight flush, or empty if none. */
+    public static int[] evaluateStraightFlush(int[] cards) {
+        return straightFlushOf(new Counts(cards));
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Scoring                                                          */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Packs a hand type and up to five tiebreak ranks into one comparable int:
+     * type in bits 20+, then five 4-bit nibbles descending in significance.
+     * Missing ranks pad with zero, which is why a short ranks array scores the
+     * same as a zero-padded one.
+     */
+    static int encodeScore(int handType, int[] ranks) {
         int score = handType << 20;
         for (int i = 0; i < 5; i++) {
             int rank = (i < ranks.length) ? ranks[i] : 0;
             score |= (rank << (4 * (4 - i)));
         }
         return score;
-   }
+    }
 
-   public static int evaluateBestHand(int[] cards) {
-        // cycle through each combination in decreasing value order.
+    /**
+     * The hand's score: higher always beats lower, across every hand type.
+     * Counts the cards once and walks the hand types in descending value,
+     * returning at the first match.
+     */
+    public static int evaluateBestHand(int[] cards) {
+        Counts c = new Counts(cards);
 
-        // straight flush
-        int[] sf = evaluateStraightFlush(cards);
+        int[] sf = straightFlushOf(c);
         if (sf.length > 0) return encodeScore(8, sf);
-        // quads
-        int[] quad = evaluateQuad(cards);
+
+        int[] quad = quadOf(c);
         if (quad.length > 0) return encodeScore(7, quad);
-        // full house
-        int[] fh = evaluateFullHouse(cards);
+
+        int[] fh = fullHouseOf(c);
         if (fh.length > 0) return encodeScore(6, fh);
-        // flush
-        int[] flush = evaluateFlush(cards);
+
+        int[] flush = flushOf(c);
         if (flush.length > 0) return encodeScore(5, flush);
-        // straight
-        int[] straight = evaluateStraight(cards);
+
+        int[] straight = straightOf(c);
         if (straight.length > 0) return encodeScore(4, straight);
-        // trips
-        int[] trip = evaluateTriple(cards);
+
+        int[] trip = tripleOf(c);
         if (trip.length > 0) return encodeScore(3, trip);
-        // two pair
-        int[] twoPair = evaluateTwoPair(cards);
+
+        int[] twoPair = twoPairOf(c);
         if (twoPair.length > 0) return encodeScore(2, twoPair);
-        // pair
-        int[] pair = evaluatePair(cards);
+
+        int[] pair = pairOf(c);
         if (pair.length > 0) return encodeScore(1, pair);
 
-        // high card (always present)
-        int[] high = evaluateHighCard(cards);
-        return encodeScore(0, high);
-   }
+        return encodeScore(0, highCardOf(c));
+    }
 
-   /**
-    * Human-readable description of the best hand in cards, e.g. "Full House,
-    * Aces full of Kings". 
-    */
-   public static String describeBestHand(int[] cards) {
-        int[] sf = evaluateStraightFlush(cards);
+    /**
+     * Human-readable description of the best hand, e.g. "Full House, Aces full
+     * of Kings". Same dispatch order as evaluateBestHand, over the same single
+     * count.
+     */
+    public static String describeBestHand(int[] cards) {
+        Counts c = new Counts(cards);
+
+        int[] sf = straightFlushOf(c);
         if (sf.length > 0) return "Straight Flush, " + rankName(sf[0]) + " High";
 
-        int[] quad = evaluateQuad(cards);
+        int[] quad = quadOf(c);
         if (quad.length > 0) return "Four of a Kind, " + rankNamePlural(quad[0]);
 
-        int[] fh = evaluateFullHouse(cards);
+        int[] fh = fullHouseOf(c);
         if (fh.length > 0) return "Full House, " + rankNamePlural(fh[0]) + " full of " + rankNamePlural(fh[1]);
 
-        int[] flush = evaluateFlush(cards);
+        int[] flush = flushOf(c);
         if (flush.length > 0) return "Flush, " + rankName(flush[0]) + " High";
 
-        int[] straight = evaluateStraight(cards);
+        int[] straight = straightOf(c);
         if (straight.length > 0) return "Straight, " + rankName(straight[0]) + " High";
 
-        int[] trip = evaluateTriple(cards);
+        int[] trip = tripleOf(c);
         if (trip.length > 0) return "Three of a Kind, " + rankNamePlural(trip[0]);
 
-        int[] twoPair = evaluateTwoPair(cards);
+        int[] twoPair = twoPairOf(c);
         if (twoPair.length > 0) return "Two Pair, " + rankNamePlural(twoPair[0]) + " and " + rankNamePlural(twoPair[1]);
 
-        int[] pair = evaluatePair(cards);
+        int[] pair = pairOf(c);
         if (pair.length > 0) return "Pair of " + rankNamePlural(pair[0]);
 
-        int[] high = evaluateHighCard(cards);
-        return "High Card, " + rankName(high[0]);
-   }
+        int[] high = highCardOf(c);
+        return "High Card, " + (high.length > 0 ? rankName(high[0]) : "none");
+    }
 
-   private static String rankName(int pokerValue) {
+    private static String rankName(int pokerValue) {
         return switch (pokerValue) {
             case 14 -> "Ace";
             case 13 -> "King";
@@ -366,9 +401,9 @@ public class HandEvaluator {
             case 2 -> "Two";
             default -> String.valueOf(pokerValue);
         };
-   }
+    }
 
-   private static String rankNamePlural(int pokerValue) {
+    private static String rankNamePlural(int pokerValue) {
         return switch (pokerValue) {
             case 14 -> "Aces";
             case 13 -> "Kings";
@@ -385,6 +420,5 @@ public class HandEvaluator {
             case 2 -> "Twos";
             default -> pokerValue + "s";
         };
-   }
+    }
 }
-

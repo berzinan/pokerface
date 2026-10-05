@@ -1,5 +1,6 @@
 package com.andrei.pokerface;
 
+/* Add class docstring here */
 public class Player {
     private final int seatIndex;          // fixed seat position at the table (0..n-1)
     private String name;
@@ -7,9 +8,9 @@ public class Player {
     private final int[] holeCards;        // size 2; -1 = not yet dealt (sentinel, consistent with CardUtils range checks)
     private int roundBet;                 // chips committed during the CURRENT betting round only
     private int totalCommitted;           // chips committed during the WHOLE hand; drives side-pot math
-    private boolean folded;
-    private boolean allIn;
-    private boolean eliminated;
+    private boolean folded;               // has this player folded?
+    private boolean allIn;                // is this player all in?
+    private boolean eliminated;           // is this player eliminated?
 
     public Player(int seatIndex, String name, int stack) {
         this.seatIndex = seatIndex;
@@ -24,7 +25,7 @@ public class Player {
     }
 
     /* Hand lifecycle */
-
+    // Deal a hole card to this player
     public void dealHoleCard(int slot, int card) {
         if (slot < 0 || slot > 1) {
             throw new IllegalArgumentException("Hole card slot must be 0 or 1");
@@ -32,6 +33,7 @@ public class Player {
         holeCards[slot] = card;
     }
 
+    // Display this player's hole cards
     public int[] getHoleCards() {
         return holeCards.clone();
     }
@@ -43,9 +45,7 @@ public class Player {
 
     /**
      * Reset all state for a brand new hand (new deal). An eliminated player
-     * resets into a permanently-folded state rather than a fresh one -- this
-     * is the single hook that makes every other fold/active/eligibility check
-     * in GameState correct for busted players with no further changes.
+     * resets into a permanently-folded state rather than a fresh one.
      */
     public void resetForNewHand() {
         roundBet = 0;
@@ -77,6 +77,7 @@ public class Player {
         }
     }
 
+    // fold
     public void fold() {
         folded = true;
     }

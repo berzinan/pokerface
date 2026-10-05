@@ -1,15 +1,17 @@
 package com.andrei.pokerface;
 
 /**
- * Determines the blinds in effect after a given amount of session time has
- * elapsed. GameState's smallBlind/bigBlind fields are final, so a change in
- * blind level means SessionRunner constructs a fresh GameState rather than
- * mutating the existing one -- see SessionRunner.runSession().
+ * Determines the blinds in effect after a given amount of elapsed session
+ * time. TournamentRunner reads the session clock once per hand and calls
+ * this, applying any change with GameState.setBlinds() between hands.
  *
- * Time-based (not hand-count-based) so a future per-decision timer feature
- * for bots and humans can share the same injectable clock abstraction --
- * a schedule keyed on hands played would need a second, incompatible
- * notion of "how much time has passed."
+ * "Elapsed time" is whatever the session clock measures, and that differs by
+ * pipeline on purpose. Human play passes the wall clock, so blinds rise in
+ * real minutes the way they would at a table. A bot-vs-bot benchmark passes a
+ * virtual clock advancing a fixed step per hand, because a thousand bot hands
+ * finish inside a second and a real clock would leave the schedule frozen at
+ * level 0 forever. Keying the interface to time rather than hands is what
+ * lets one schedule serve both.
  */
 @FunctionalInterface
 public interface BlindSchedule {

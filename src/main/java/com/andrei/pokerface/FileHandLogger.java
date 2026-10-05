@@ -46,6 +46,9 @@ public class FileHandLogger implements HandLogger, AutoCloseable {
 
     private String format(GameEvent event) {
         return switch (event) {
+            case GameEvent.DecisionTimed e -> "DECISION   seat=%d round=%-7s elapsed=%.3fms%s"
+                    .formatted(e.seatIndex(), e.round(), e.elapsedNanos() / 1_000_000.0,
+                               e.timedOut() ? "  TIMED_OUT" : "");
             case GameEvent.HandStarted e -> "HAND_START dealer=%d seed=%d"
                     .formatted(e.dealerSeat(), e.handSeed());
             case GameEvent.BlindPosted e -> "BLIND      seat=%d type=%-3s amount=%d stack=%d"

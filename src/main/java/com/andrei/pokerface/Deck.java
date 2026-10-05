@@ -1,8 +1,14 @@
 package com.andrei.pokerface;
 import java.util.Random;
 
+/* A deck of cards used throughout the game.
+ * Integer array storing 52 cards as integers in [0, 51]
+ * Given an integer c:
+ *      - rank = c (mod 13)
+ *      - suit = c (mod 4)
+ * Supports shuffling and dealing
+ */
 public class Deck {
-    // Responsible for dealing and shuffling cards
     private final int[] cards;
     private int topIndex = 51;
 
@@ -17,6 +23,12 @@ public class Deck {
     /* Deck Methods */
 
     public void shuffle(int seed) {
+        // rebuild deck in canonical order
+        for (int i = 0; i < 52; i++) {
+            cards[i] = i;
+        }
+        topIndex = 51;
+
         // shuffle the cards using the Fisher-Yates shuffle
         Random numgen = new Random(seed);
         for (int i = cards.length - 1; i > 0; i--) {
@@ -38,7 +50,7 @@ public class Deck {
     }
 
     /**
-     * Discards the top card without returning it. Functionally equivalent to
+     * Discards the top card without returning it. Equivalent to
      * calling deal() and ignoring the result, but named separately so
      *  a burned card is never even exposed to a caller.
      */
@@ -54,16 +66,4 @@ public class Deck {
         return topIndex + 1;
     }
     
-    /**
-     * Restores the deck to a full, unshuffled 52-card state so it can be reused
-     * for the next hand. Callers should invoke shuffle(seed) immediately after
-     * reset() if they want a fresh random order.
-     */
-    public void reset() {
-        for (int i = 0; i < 52; i++) {
-            cards[i] = i;
-        }
-        topIndex = 51;
-    }
-
 }

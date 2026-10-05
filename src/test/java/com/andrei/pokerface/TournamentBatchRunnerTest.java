@@ -33,7 +33,7 @@ public class TournamentBatchRunnerTest {
         assertThrows(IllegalArgumentException.class, () -> TournamentBatchRunner.runBatch(
                 () -> makePlayers(2, 200), List.of(),
                 BlindSchedule.constant(5, 10), BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 5));
+                TournamentEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 5));
     }
 
     @Test
@@ -42,7 +42,7 @@ public class TournamentBatchRunnerTest {
         assertThrows(IllegalArgumentException.class, () -> TournamentBatchRunner.runBatch(
                 () -> makePlayers(2, 200), agents,
                 BlindSchedule.constant(5, 10), BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 0));
+                TournamentEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 0));
     }
 
     @Test
@@ -54,7 +54,7 @@ public class TournamentBatchRunnerTest {
         assertThrows(IllegalArgumentException.class, () -> TournamentBatchRunner.runBatch(
                 badFactory, agents,
                 BlindSchedule.constant(5, 10), BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 3));
+                TournamentEndCondition.LAST_PLAYER_STANDING, incrementingSeeds(), HandLogger.NO_OP, 3));
     }
 
     // -------------------------------------------------------------------------
@@ -169,7 +169,7 @@ public class TournamentBatchRunnerTest {
                 () -> makePlayers(2, 200), agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(30),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(30),
                 incrementingSeeds(),
                 HandLogger.NO_OP,
                 200);
@@ -195,7 +195,7 @@ public class TournamentBatchRunnerTest {
                 () -> makePlayers(2, 1000), agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(10),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(10),
                 incrementingSeeds(),
                 HandLogger.NO_OP,
                 5);

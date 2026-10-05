@@ -23,24 +23,12 @@ public class GameState {
     private int dealerIndex;              // seat index of the dealer button
     private int playerTurnIndex;          // seat index of the player currently acting
     private Round round;                  // PREFLOP, FLOP, TURN, RIVER, SHOWDOWN
-    private final int smallBlind;
-    private final int bigBlind;
-    private boolean handComplete;          // true once the hand has resolved (fold-out or showdown)
-    private HandLogger logger;             // event subscriber; defaults to a no-op so logging is opt-in
+    private int smallBlind;               // mutable: a tournament escalates blinds between hands
+    private int bigBlind;                 // mutable: see setBlinds()
+    private boolean handComplete;         // true once the hand has resolved (fold-out or showdown)
+    private HandLogger logger;            // event subscriber; defaults to a no-op so logging is opt-in
 
     public GameState(List<Player> players, int smallBlind, int bigBlind) {
-        this(players, smallBlind, bigBlind, 0);
-    }
-
-    /**
-     * Overload used by SessionRunner when the blind level changes mid-session:
-     * smallBlind/bigBlind are final, so a new level means a new GameState, but
-     * the dealer button must carry over rather than reset to seat 0.
-     * initialDealerIndex should be the OUTGOING state's getDealerIndex() -- the
-     * first startNewHand() call on the new state advances it exactly as it
-     * would have on the old one.
-     */
-    public GameState(List<Player> players, int smallBlind, int bigBlind, int initialDealerIndex) {
         if (players == null || players.size() < 2) {
             throw new IllegalArgumentException("Need at least 2 players to start a hand");
         }
@@ -52,12 +40,38 @@ public class GameState {
         this.smallBlind = smallBlind;
         this.bigBlind = bigBlind;
         this.round = Round.PREFLOP;
-        this.dealerIndex = initialDealerIndex;
-        this.playerTurnIndex = initialDealerIndex;
+        this.dealerIndex = 0;
+        this.playerTurnIndex = 0;
         this.currentBet = 0;
         this.minRaise = bigBlind;
         this.handComplete = false;
         this.logger = HandLogger.NO_OP;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Blind level                                                     */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Changes the blinds in effect. Call only BETWEEN hands: the new bigBlind
+     * reaches minRaise via startNewHand(), so changing blinds mid-hand would
+     * leave the current round enforcing the previous level's minimum raise.
+     *
+     * A table's blind level is the one piece of its configuration that
+     * legitimately changes over a session, which is why it lives here as
+     * mutable state rather than forcing a whole new GameState per level.
+     * The escalation POLICY -- when to step up, by how much, rounded to what
+     * denomination -- deliberately stays outside the engine.
+     */
+    public void setBlinds(int smallBlind, int bigBlind) {
+        if (smallBlind <= 0 || bigBlind <= 0) {
+            throw new IllegalArgumentException("Blinds must be positive");
+        }
+        if (bigBlind < smallBlind) {
+            throw new IllegalArgumentException("Big blind cannot be smaller than the small blind");
+        }
+        this.smallBlind = smallBlind;
+        this.bigBlind = bigBlind;
     }
 
     /* -------------------------------------------------------------- */
@@ -98,9 +112,10 @@ public class GameState {
         if (communityCardsDealt == 0 || communityCardsDealt == 3 || communityCardsDealt == 4) {
             deck.burn();
         }
-        communityCards[communityCardsDealt] = deck.deal();
+        int card = deck.deal();
+        communityCards[communityCardsDealt] = card;
         communityCardsDealt++;
-        logger.log(new GameEvent.CommunityCardDealt(round, communityCards[communityCardsDealt - 1], communityCardsDealt));
+        logger.log(new GameEvent.CommunityCardDealt(round, card, communityCardsDealt));
     }
 
     /** Returns only the community cards dealt so far */
@@ -164,6 +179,7 @@ public class GameState {
             }
         }
         // No active players remain (everyone left is folded or all-in) -- betting is over for this round.
+        // Note: this relies on eliminated players being folded, which resetForNewHand() guarantees.
     }
 
     /** Number of players still in the session (not eliminated). Distinct from
@@ -321,6 +337,8 @@ public class GameState {
      * Recomputes the main pot and any side pots from each player's totalCommitted.
      * Call this at showdown, or any time an all-in happens and you need to know the
      * current pot structure.
+     *  If you only need the total, use totalPot() -- it does
+     * not depend on this having been called.
      *
      * Algorithm: gather every distinct totalCommitted value (the "layers" at which someone
      * capped out), sorted ascending. Between two consecutive layers, every player who
@@ -383,10 +401,15 @@ public class GameState {
         return pots;
     }
 
+    /**
+     * Every chip committed this hand, across all pots and all contributors,
+     * folded players included.
+     *
+     */
     public int totalPot() {
         int sum = 0;
-        for (Pot p : pots) {
-            sum += p.getAmount();
+        for (Player p : players) {
+            sum += p.getTotalCommitted();
         }
         return sum;
     }
@@ -445,7 +468,6 @@ public class GameState {
         if (remaining.size() != 1) {
             return Optional.empty();
         }
-        computeSidePots();
         int winnings = totalPot();
         Player winner = remaining.get(0);
         winner.addToStack(winnings);
@@ -518,12 +540,11 @@ public class GameState {
     /* -------------------------------------------------------------- */
 
     public void startNewHand(int seed) {
-        deck.reset();
         Arrays.fill(communityCards, -1);
         communityCardsDealt = 0;
         pots.clear();
         currentBet = 0;
-        minRaise = bigBlind;
+        minRaise = bigBlind; // picks up any blind level change applied since the last hand
         round = Round.PREFLOP;
         handComplete = false;
         for (Player p : players) {
@@ -531,7 +552,7 @@ public class GameState {
         }
         dealerIndex = liveSeatOffset(dealerIndex, 1);
         playerTurnIndex = dealerIndex;
-        dealHoleCards(seed); // shuffles the freshly reset deck, then deals
+        dealHoleCards(seed); // shuffle() restores a full 52-card deck, then deals
 
         logger.log(new GameEvent.HandStarted(dealerIndex, seed));
     }
@@ -541,11 +562,22 @@ public class GameState {
     /* -------------------------------------------------------------- */
 
     /**
+     *  Equivalent to buildPlayerView(seatIndex, PlayerView.UNLIMITED)
+     */
+    public PlayerView buildPlayerView(int seatIndex) {
+        return buildPlayerView(seatIndex, PlayerView.UNLIMITED);
+    }
+
+    /**
      * Builds the information-restricted view for the player in the given seat.
      * This is the ONLY channel through which a PokerAgent should see game state --
      * never pass a Player or GameState reference to an agent directly.
+     * 
+     * timeBudgetMillis is passed straight through the view. GameState neither
+     * reads a clock nor enforces the budget; it only carries the number the turn
+     * driver supplies, so the engine is time-free.
      */
-    public PlayerView buildPlayerView(int seatIndex) {
+    public PlayerView buildPlayerView(int seatIndex, long timeBudgetMillis) {
         Player self = players.get(seatIndex);
 
         List<OpponentInfo> infos = new ArrayList<>();
@@ -561,12 +593,6 @@ public class GameState {
             ));
         }
 
-        computeSidePots();
-        List<Integer> potAmounts = new ArrayList<>();
-        for (Pot pot : pots) {
-            potAmounts.add(pot.getAmount());
-        }
-
         return new PlayerView(
                 seatIndex,
                 self.getHoleCards(),
@@ -577,24 +603,13 @@ public class GameState {
                 currentBet,
                 currentBet + minRaise,
                 totalPot(),
-                potAmounts,
-                infos
+                infos,
+                timeBudgetMillis
         );
     }
 
-    /**
-     * Convenience driver: builds the view for whoever's turn it is, asks the agent
-     * to decide, and applies the result. Equivalent to calling
-     * buildPlayerView(getPlayerTurnIndex()) + processAction() yourself.
-     */
-    public void takeTurn(PokerAgent agent) {
-        PlayerView view = buildPlayerView(playerTurnIndex);
-        ActionResult result = agent.performAction(view);
-        processAction(result.action(), result.amount());
-    }
-
     /* -------------------------------------------------------------- */
-    /* Getters / setters                                                */
+    /* Getters                                                          */
     /* -------------------------------------------------------------- */
 
     public List<Player> getPlayers() { return players; }
@@ -609,5 +624,4 @@ public class GameState {
     public int getSmallBlind() { return smallBlind; }
     public int getBigBlind() { return bigBlind; }
     public boolean isHandComplete() { return handComplete; }
-    public void setHandComplete(boolean handComplete) { this.handComplete = handComplete; }
 }

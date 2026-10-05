@@ -176,7 +176,7 @@ public class SessionRunnerTest {
         SessionRunner.runSession(
                 players, agents, schedule,
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(5),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(5),
                 incrementingSeeds(),
                 logger,
                 clock);
@@ -210,7 +210,7 @@ public class SessionRunnerTest {
         SessionRunner.runSession(
                 players, agents, schedule,
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(6),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(6),
                 incrementingSeeds(),
                 logger,
                 clock);
@@ -245,7 +245,7 @@ public class SessionRunnerTest {
     @Test
     void lastPlayerStanding_falseWhileMultiplePlayersLive() {
         GameState state = new GameState(makePlayers(3, 1000), 5, 10);
-        assertFalse(SessionEndCondition.LAST_PLAYER_STANDING.isSessionOver(state, 5));
+        assertFalse(TournamentEndCondition.LAST_PLAYER_STANDING.isSessionOver(state, 5));
     }
 
     @Test
@@ -253,13 +253,13 @@ public class SessionRunnerTest {
         GameState state = new GameState(makePlayers(3, 1000), 5, 10);
         state.getPlayers().get(0).eliminate();
         state.getPlayers().get(1).eliminate();
-        assertTrue(SessionEndCondition.LAST_PLAYER_STANDING.isSessionOver(state, 5));
+        assertTrue(TournamentEndCondition.LAST_PLAYER_STANDING.isSessionOver(state, 5));
     }
 
     @Test
     void orAfter_stopsOnceHandCapReachedEvenIfMultipleLive() {
         GameState state = new GameState(makePlayers(3, 1000), 5, 10);
-        SessionEndCondition capped = SessionEndCondition.LAST_PLAYER_STANDING.orAfter(10);
+        TournamentEndCondition capped = TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(10);
 
         assertFalse(capped.isSessionOver(state, 9));
         assertTrue(capped.isSessionOver(state, 10));
@@ -270,7 +270,7 @@ public class SessionRunnerTest {
         GameState state = new GameState(makePlayers(3, 1000), 5, 10);
         state.getPlayers().get(0).eliminate();
         state.getPlayers().get(1).eliminate();
-        SessionEndCondition capped = SessionEndCondition.LAST_PLAYER_STANDING.orAfter(1000);
+        TournamentEndCondition capped = TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(1000);
 
         assertTrue(capped.isSessionOver(state, 1), "elimination should end the session long before the cap");
     }
@@ -314,7 +314,7 @@ public class SessionRunnerTest {
                 players, agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING,
+                TournamentEndCondition.LAST_PLAYER_STANDING,
                 incrementingSeeds(),
                 HandLogger.NO_OP));
     }
@@ -335,7 +335,7 @@ public class SessionRunnerTest {
                 players, agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(30),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(30),
                 incrementingSeeds(),
                 HandLogger.NO_OP);
 
@@ -354,7 +354,7 @@ public class SessionRunnerTest {
                 players, agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(30),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(30),
                 incrementingSeeds(),
                 HandLogger.NO_OP);
 
@@ -381,7 +381,7 @@ public class SessionRunnerTest {
                 players, agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(2000),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(2000),
                 incrementingSeeds(),
                 HandLogger.NO_OP);
 
@@ -409,7 +409,7 @@ public class SessionRunnerTest {
                 players, agents,
                 BlindSchedule.constant(5, 10),
                 BustHandler.ELIMINATE,
-                SessionEndCondition.LAST_PLAYER_STANDING.orAfter(10),
+                TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(10),
                 incrementingSeeds(),
                 HandLogger.NO_OP);
 
@@ -460,7 +460,7 @@ public class SessionRunnerTest {
                         players, agents,
                         BlindSchedule.constant(5, 10),
                         BustHandler.ELIMINATE,
-                        SessionEndCondition.LAST_PLAYER_STANDING.orAfter(1000),
+                        TournamentEndCondition.LAST_PLAYER_STANDING.orAfter(1000),
                         seedSource,
                         HandLogger.NO_OP);
 
