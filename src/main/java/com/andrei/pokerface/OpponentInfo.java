@@ -13,5 +13,6 @@ public record OpponentInfo(
         int roundBet,
         int totalCommitted,
         boolean folded,
-        boolean allIn
+        boolean allIn,
+        boolean eliminated
 ) {}

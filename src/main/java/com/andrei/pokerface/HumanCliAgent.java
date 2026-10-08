@@ -244,11 +244,22 @@ public class HumanCliAgent implements PokerAgent {
                 + "  To call: " + view.amountToCall());
         out.println("Your stack: " + me.stack() + "  Your round bet: " + me.roundBet());
         if (canRaise) {
-            out.println("Min raise target: " + view.minRaiseTarget() + "  Max (all-in) target: " + maxTarget);
+            // A full min-raise can exceed the stack. Shoving is still a legal
+            // short all-in raise, so advertise that rather than a target the
+            // player cannot reach.
+            if (view.minRaiseTarget() > maxTarget) {
+                out.println("Raise: all-in only, for " + maxTarget
+                        + " (a full raise would need " + view.minRaiseTarget() + ").");
+            } else {
+                out.println("Min raise target: " + view.minRaiseTarget()
+                        + "  Max (all-in) target: " + maxTarget);
+            }
         }
         out.println("Seats:");
         for (OpponentInfo o : view.players()) {
-            String status = o.folded() ? "folded" : (o.allIn() ? "all-in" : "active");
+            String status = o.eliminated() ? "out"
+                    : o.folded() ? "folded"
+                    : o.allIn() ? "all-in" : "active";
             String marker = (o.seatIndex() == view.mySeatIndex()) ? " (you)" : "";
             out.println("  " + o.seatIndex() + " " + o.name() + marker
                     + " stack=" + o.stack() + " bet=" + o.roundBet() + " [" + status + "]");

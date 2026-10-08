@@ -589,7 +589,8 @@ public class GameState {
                     p.getRoundBet(),
                     p.getTotalCommitted(),
                     p.isFolded(),
-                    p.isAllIn()
+                    p.isAllIn(),
+                    p.isEliminated()
             ));
         }
 

@@ -83,6 +83,9 @@ public class ConsoleHandLogger implements HandLogger {
 
         out.println("---- Showdown ----");
         int[] boardCards = board.stream().mapToInt(Integer::intValue).toArray();
+        if (boardCards.length > 0) {
+            out.println("  Board: " + CardUtils.handToString(boardCards));
+        }
         for (Player p : players) {
             int[] hole = p.getHoleCards(); // returns a clone; read once and reuse
             if (p.isFolded() || hole[0] < 0) {
