@@ -5,24 +5,62 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * PokerAgent backed by a human at a terminal. Renders the PlayerView as
- * readable text, reads a command line, validates it against the same
- * legality rules GameState.processAction enforces, and re-prompts on any
- * violation instead of ever handing GameState something that would throw.
+ * readable text, reads a command, validates it against the same legality rules
+ * GameState.processAction enforces, and re-prompts on any violation rather than
+ * ever handing GameState something that would throw.
  *
- * Input/output are injected (not System.in/System.out directly) so tests
- * can drive this with canned input and capture output without touching the
- * real console.
+ * Input/output are injected (not System.in/System.out directly) so tests can
+ * drive this with canned input and capture output without touching the real
+ * console.
+ *
+ * THREADING. Reading input on a timer is the whole reason this class is more
+ * complicated than it looks. BufferedReader.readLine() blocks and cannot be
+ * portably interrupted -- there is no timeout variant, and interrupting the
+ * thread does not unblock a read on System.in. So a dedicated daemon thread
+ * does nothing but read lines and hand them to a BlockingQueue, and the game
+ * thread waits on that queue with a timeout it CAN abandon. The human is idle
+ * while we wait, so abandoning the wait is safe; what Java cannot interrupt is
+ * computation, and there is none here.
+ *
+ * The reader thread is a daemon and is never stopped. It spends its life
+ * blocked in readLine() on a stream this class does not own, so there is
+ * nothing meaningful to close -- the daemon flag is what lets the JVM exit
+ * anyway. It starts lazily on the first decision, so an instance that is
+ * constructed and never used spawns nothing.
+ *
+ * Only one human seat is supported per input stream. Two instances reading the
+ * same System.in would race for lines, and whichever thread won would be
+ * arbitrary.
  */
 public class HumanCliAgent implements PokerAgent {
+
+    /** Sentinel deadline meaning "wait as long as it takes". */
+    private static final long NO_DEADLINE = Long.MIN_VALUE;
 
     private final BufferedReader in;
     private final PrintStream out;
     private final String name;
+
+    /** Lines read so far, oldest first; the endOfInput marker is the last entry. */
+    private final BlockingQueue<Line> pendingLines = new LinkedBlockingQueue<>();
+
+    /** Set once the stream ends or fails, so later turns fail fast instead of waiting. */
+    private volatile boolean inputClosed = false;
+
+    /** Non-null when the stream failed rather than ending cleanly; reported as the cause. */
+    private volatile IOException readFailure = null;
+
+    private Thread readerThread = null;
+
+    /** One line of input, or the marker that no more will arrive. */
+    private record Line(String text, boolean endOfInput) {}
 
     public HumanCliAgent(InputStream in, PrintStream out) {
         this(in, out, "Human");
@@ -36,11 +74,23 @@ public class HumanCliAgent implements PokerAgent {
 
     @Override
     public ActionResult performAction(PlayerView view) {
-        render(view);
+        startReaderIfNeeded();
+
+        // One deadline for the whole turn, not per prompt -- otherwise typing
+        // nonsense would buy unlimited extra thinking time.
+        long deadlineNanos = view.isTimed()
+                ? System.nanoTime() + view.timeBudgetMillis() * 1_000_000L
+                : NO_DEADLINE;
+
+        render(view, deadlineNanos);
+
         while (true) {
-            out.print("> ");
-            out.flush();
-            String line = readLine();
+            prompt(deadlineNanos);
+            String line = awaitLine(deadlineNanos);
+            if (line == null) {
+                return onTimeout(view);
+            }
+
             ParsedCommand parsed = parse(line);
             if (parsed == null) {
                 out.println("Unrecognized command. Options: fold, check, call, raise <amount>, allin");
@@ -61,10 +111,126 @@ public class HumanCliAgent implements PokerAgent {
     }
 
     /* -------------------------------------------------------------- */
+    /* Input reading                                                     */
+    /* -------------------------------------------------------------- */
+
+    private void startReaderIfNeeded() {
+        if (readerThread != null) {
+            return;
+        }
+        readerThread = new Thread(this::readLoop, "pokerface-human-input");
+        readerThread.setDaemon(true);
+        readerThread.start();
+    }
+
+    /**
+     * Reads lines until the stream ends, queueing each one. An IOException is
+     * treated as end of input: the stream is gone either way, and the cause is
+     * kept so the game thread can report it.
+     */
+    private void readLoop() {
+        try {
+            String line;
+            while ((line = in.readLine()) != null) {
+                pendingLines.put(new Line(line, false));
+            }
+        } catch (IOException e) {
+            readFailure = e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        inputClosed = true;
+        // Wakes a waiting game thread immediately rather than letting it sit
+        // out the full move timer for input that will never arrive.
+        pendingLines.offer(new Line(null, true));
+    }
+
+    /**
+     * Waits for the next line, up to the deadline.
+     *
+     * @return the line, or null if the deadline passed first
+     * @throws IllegalStateException if the input stream has ended
+     */
+    private String awaitLine(long deadlineNanos) {
+        if (inputClosed && pendingLines.isEmpty()) {
+            throw inputClosedException();
+        }
+        try {
+            Line line;
+            if (deadlineNanos == NO_DEADLINE) {
+                line = pendingLines.take();
+            } else {
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    return null;
+                }
+                line = pendingLines.poll(remainingNanos, TimeUnit.NANOSECONDS);
+                if (line == null) {
+                    return null;
+                }
+            }
+            if (line.endOfInput()) {
+                throw inputClosedException();
+            }
+            return line.text();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for human input", e);
+        }
+    }
+
+    private IllegalStateException inputClosedException() {
+        String message = "Input stream closed before a command was entered. "
+                + "If you're launching via 'mvn exec:java', stdin may not be attached correctly -- "
+                + "run 'java -cp target/classes com.andrei.pokerface.Play' instead.";
+        return readFailure == null
+                ? new IllegalStateException(message)
+                : new IllegalStateException(message, readFailure);
+    }
+
+    /**
+     * Discards anything already typed. Called only after a timeout: a keystroke
+     * that lands after the deadline was not an action on this turn, and letting
+     * it sit in the queue would make it the answer to the NEXT decision --
+     * applying a command the human chose while looking at a different board.
+     *
+     * Deliberately not called before a turn, so piped input (tests, scripted
+     * sessions) can queue every command up front and still be consumed in
+     * order.
+     */
+    private void drainPendingInput() {
+        pendingLines.removeIf(line -> !line.endOfInput());
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Timeout                                                           */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * What a human who ran out of time is deemed to have done: check if it
+     * costs nothing, otherwise fold. Matches the fallback HandRunner applies to
+     * any agent that overruns, so a human and a bot are treated identically.
+     *
+     * Returning here rather than blocking on is what makes the timer real:
+     * HandRunner's own enforcement would discard a late answer, but only after
+     * waiting for one.
+     */
+    private ActionResult onTimeout(PlayerView view) {
+        drainPendingInput();
+        boolean free = view.amountToCall() == 0;
+        out.println();
+        out.println(free
+                ? "Out of time -- checked for you."
+                : "Out of time -- folded for you.");
+        return free ? ActionResult.check() : ActionResult.fold();
+    }
+
+    /* -------------------------------------------------------------- */
     /* Rendering                                                        */
     /* -------------------------------------------------------------- */
 
-    private void render(PlayerView view) {
+    private void render(PlayerView view, long deadlineNanos) {
         OpponentInfo me = view.me();
         int maxTarget = me.roundBet() + me.stack();
         boolean canRaise = maxTarget > view.currentBet();
@@ -87,35 +253,39 @@ public class HumanCliAgent implements PokerAgent {
             out.println("  " + o.seatIndex() + " " + o.name() + marker
                     + " stack=" + o.stack() + " bet=" + o.roundBet() + " [" + status + "]");
         }
+        if (deadlineNanos != NO_DEADLINE) {
+            out.println("You have " + secondsRemaining(deadlineNanos) + "s to act "
+                    + "(no action = check if free, else fold).");
+        }
         out.println("Commands: fold | check | call | raise <amount> | allin");
     }
 
     private String renderHoleCards(int[] holeCards) {
-    for (int c : holeCards) {
-        if (c < 0) {
-            return "(not dealt)";
-        }
-    }
-    return CardUtils.handToString(holeCards);
-}
-
-    /* -------------------------------------------------------------- */
-    /* Input reading                                                     */
-    /* -------------------------------------------------------------- */
-
-    private String readLine() {
-        try {
-            String line = in.readLine();
-            if (line == null) {
-                throw new IllegalStateException(
-                        "Input stream closed before a command was entered. "
-                        + "If you're launching via 'mvn exec:java', stdin may not be attached correctly -- "
-                        + "run 'java -cp target/classes com.andrei.pokerface.PlayHuman' instead.");
+        for (int c : holeCards) {
+            if (c < 0) {
+                return "(not dealt)";
             }
-            return line;
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed reading human input", e);
         }
+        return CardUtils.handToString(holeCards);
+    }
+
+    /**
+     * Shows the seconds left on a timed turn, so a re-prompt after a bad
+     * command tells the human how much of their budget it cost.
+     */
+    private void prompt(long deadlineNanos) {
+        if (deadlineNanos == NO_DEADLINE) {
+            out.print("> ");
+        } else {
+            out.print("(" + secondsRemaining(deadlineNanos) + "s) > ");
+        }
+        out.flush();
+    }
+
+    /** Whole seconds left, rounded up so a live timer never reads 0 while still open. */
+    private long secondsRemaining(long deadlineNanos) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        return remainingNanos <= 0 ? 0 : (remainingNanos + 999_999_999L) / 1_000_000_000L;
     }
 
     /* -------------------------------------------------------------- */
